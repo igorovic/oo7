@@ -379,6 +379,11 @@ impl GNOMEPrompterCallback {
                 Properties::for_change_password(label, self.window_id.as_ref()),
                 PromptType::Password,
             ),
+            PromptRole::Access => {
+                return Err(custom_service_error(
+                    "Access prompts need the socket prompter.",
+                ));
+            }
         };
 
         let prompter = GNOMEPrompterProxy::new(connection).await?;
@@ -455,6 +460,11 @@ impl GNOMEPrompterCallback {
 
                 let path = self.path.clone();
                 tokio::spawn(async move { prompter.stop_prompting(&path).await });
+            }
+            PromptRole::Access => {
+                return Err(custom_service_error(
+                    "Access prompts need the socket prompter.",
+                ));
             }
         }
         Ok(())

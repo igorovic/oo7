@@ -18,10 +18,15 @@ use tokio::sync::{Mutex, RwLock};
 use zbus::{interface, object_server::SignalEmitter, proxy::Defaults, zvariant};
 use zvariant::{ObjectPath, OwnedObjectPath};
 
+use zbus::{message::Header, names::OwnedUniqueName};
+
 use crate::{
     Service,
     error::{Error, custom_service_error},
     item,
+    prompt::AccessStep,
+    service::client_of,
+    socket_prompter::Operation,
 };
 
 #[derive(Clone)]
@@ -45,23 +50,39 @@ impl Collection {
     #[zbus(out_args("prompt"))]
     pub async fn delete(
         &self,
-        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(header)] header: Header<'_>,
     ) -> Result<OwnedObjectPath, ServiceError> {
         let caller = if let Some(sender) = header.sender() {
             self.service.peer_display_name(sender).await
         } else {
             "unknown".to_string()
         };
+        // With per-client access, deleting always asks.
+        let ask_access = self.service.per_client_access();
         // Check if collection is locked
-        if self.is_locked().await {
+        if self.is_locked().await || ask_access {
             // Create a prompt to unlock and delete the collection
-            let prompt = crate::prompt::Prompt::new(
+            let role = if self.is_locked().await {
+                crate::prompt::PromptRole::Unlock
+            } else {
+                crate::prompt::PromptRole::Access
+            };
+            let mut prompt = crate::prompt::Prompt::new(
                 self.service.clone(),
-                crate::prompt::PromptRole::Unlock,
+                role,
                 self.label().await,
                 Some(self.clone()),
             )
             .await;
+            if ask_access {
+                let Some(client) = client_of(&header) else {
+                    return Err(custom_service_error("The client has no bus name."));
+                };
+                prompt = prompt.with_client(client).with_access(AccessStep {
+                    operation: Operation::Delete,
+                    objects: vec![self.path.clone()],
+                });
+            }
             let prompt_path = OwnedObjectPath::from(prompt.path().clone());
 
             let collection = self.clone();
@@ -180,7 +201,7 @@ impl Collection {
         properties: Properties,
         secret: DBusSecretInner,
         replace: bool,
-        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(header)] header: Header<'_>,
     ) -> Result<(OwnedObjectPath, OwnedObjectPath), ServiceError> {
         let caller = if let Some(sender) = header.sender() {
             self.service.peer_display_name(sender).await
@@ -188,6 +209,7 @@ impl Collection {
             "unknown".to_string()
         };
         tracing::debug!("CreateItem called by {caller} with session {}", secret.0);
+        let client = client_of(&header);
         if self.is_locked().await {
             // Create a prompt to unlock the collection and create the item
             let prompt = crate::prompt::Prompt::new(
@@ -205,7 +227,7 @@ impl Collection {
                     collection.set_locked(false, unlock_secret).await?;
 
                     let item_path = collection
-                        .create_item_unlocked(properties, secret, replace)
+                        .create_item_unlocked(properties, secret, replace, client)
                         .await?;
 
                     Ok(zvariant::Value::new(item_path).try_into_owned().unwrap())
@@ -232,117 +254,10 @@ impl Collection {
         }
 
         let item_path = self
-            .create_item_unlocked(properties, secret, replace)
+            .create_item_unlocked(properties, secret, replace, client)
             .await?;
 
         Ok((item_path, OwnedObjectPath::default()))
-    }
-
-    async fn create_item_unlocked(
-        &self,
-        properties: Properties,
-        secret: DBusSecretInner,
-        replace: bool,
-    ) -> Result<OwnedObjectPath, ServiceError> {
-        let keyring_guard = self.keyring.read().await;
-        let keyring = match keyring_guard.as_ref() {
-            Some(k) if !k.is_locked() => k.as_unlocked(),
-            _ => return Err(ServiceError::IsLocked("Collection is locked".to_owned())),
-        };
-
-        let DBusSecretInner(ref session_path, ref iv, ref secret_bytes, ref content_type) = secret;
-        let label = properties.label();
-        // Safe to unwrap as an item always has attributes
-        let mut attributes = properties.attributes().unwrap().to_owned();
-
-        let Some(session) = self.service.session(session_path).await else {
-            tracing::error!(
-                "The session `{}` does not exist, referenced while creating item in collection `{}`.",
-                session_path,
-                self.path
-            );
-            return Err(ServiceError::NoSession(format!(
-                "The session `{session_path}` does not exist."
-            )));
-        };
-
-        let secret = match session.aes_key() {
-            Some(key) => oo7::crypto::decrypt(secret_bytes, &key, iv)
-                .map_err(|err| custom_service_error(&format!("Failed to decrypt secret {err}.")))?,
-            None => zeroize::Zeroizing::new(secret_bytes.clone()),
-        };
-
-        // Ensure content-type attribute is stored
-        if !attributes.contains_key(oo7::CONTENT_TYPE_ATTRIBUTE) {
-            attributes.insert(
-                oo7::CONTENT_TYPE_ATTRIBUTE.to_owned(),
-                content_type.as_str().to_owned(),
-            );
-        }
-
-        let item = keyring
-            .create_item(label, &attributes, secret, replace)
-            .await
-            .map_err(|err| custom_service_error(&format!("Failed to create a new item {err}.")))?;
-
-        let key = keyring
-            .key()
-            .await
-            .map_err(|err| custom_service_error(&format!("Failed to derive key: {err}")))?;
-        drop(keyring_guard);
-
-        let n_items = *self.item_index.read().await;
-        let item_path = OwnedObjectPath::try_from(format!("{}/{n_items}", self.path)).unwrap();
-
-        let item = item::Item::new(
-            item.into(),
-            self.service.clone(),
-            self.path.clone(),
-            item_path.clone(),
-        );
-        *self.item_index.write().await = n_items + 1;
-
-        let object_server = self.service.object_server();
-        let signal_emitter = self.service.signal_emitter(&self.path)?;
-
-        // Remove any existing items with the same attributes
-        if replace {
-            let existing_items = self
-                .search_items_exact_with_key(&attributes, key.as_deref())
-                .await?;
-            if !existing_items.is_empty() {
-                let mut items = self.items.lock().await;
-                for existing in &existing_items {
-                    let existing_path = existing.path();
-
-                    items.retain(|i| i.path() != existing_path);
-                    object_server.remove::<item::Item, _>(existing_path).await?;
-                    Self::item_deleted(&signal_emitter, existing_path).await?;
-
-                    tracing::debug!("Replaced item `{}`", existing_path);
-                }
-                drop(items);
-            }
-        }
-
-        self.items.lock().await.push(item.clone());
-
-        object_server.at(&item_path, item).await?;
-
-        self.update_modified().await?;
-
-        Self::item_created(&signal_emitter, &item_path).await?;
-        self.items_changed(&signal_emitter).await?;
-
-        match session.peer_info() {
-            Some(info) => tracing::info!(
-                "Item `{item_path}` created by {} ({info}).",
-                session.sender()
-            ),
-            None => tracing::info!("Item `{item_path}` created by {}.", session.sender()),
-        }
-
-        Ok(item_path)
     }
 
     #[zbus(property, name = "Items")]
@@ -448,6 +363,144 @@ pub(crate) fn collection_path(label: &str) -> Result<OwnedObjectPath, zvariant::
 }
 
 impl Collection {
+    async fn create_item_unlocked(
+        &self,
+        properties: Properties,
+        secret: DBusSecretInner,
+        replace: bool,
+        client: Option<OwnedUniqueName>,
+    ) -> Result<OwnedObjectPath, ServiceError> {
+        // With per-client access, a client replaces only items it may use:
+        // otherwise any program could overwrite another's secret. The new item
+        // is then stored next to them.
+        let replace = replace && {
+            let mut may_replace = true;
+            if let Some(attributes) = properties.attributes() {
+                for existing in self.search_inner_items(attributes).await? {
+                    if !self
+                        .service
+                        .may_access(client.as_ref(), existing.path())
+                        .await
+                    {
+                        may_replace = false;
+                        break;
+                    }
+                }
+            }
+            if !may_replace {
+                tracing::info!("Not replacing items the client may not use.");
+            }
+            may_replace
+        };
+
+        let keyring_guard = self.keyring.read().await;
+        let keyring = match keyring_guard.as_ref() {
+            Some(k) if !k.is_locked() => k.as_unlocked(),
+            _ => return Err(ServiceError::IsLocked("Collection is locked".to_owned())),
+        };
+
+        let DBusSecretInner(ref session_path, ref iv, ref secret_bytes, ref content_type) = secret;
+        let label = properties.label();
+        // Safe to unwrap as an item always has attributes
+        let mut attributes = properties.attributes().unwrap().to_owned();
+
+        let Some(session) = self.service.session(session_path).await else {
+            tracing::error!(
+                "The session `{}` does not exist, referenced while creating item in collection `{}`.",
+                session_path,
+                self.path
+            );
+            return Err(ServiceError::NoSession(format!(
+                "The session `{session_path}` does not exist."
+            )));
+        };
+
+        let secret = match session.aes_key() {
+            Some(key) => oo7::crypto::decrypt(secret_bytes, &key, iv)
+                .map_err(|err| custom_service_error(&format!("Failed to decrypt secret {err}.")))?,
+            None => zeroize::Zeroizing::new(secret_bytes.clone()),
+        };
+
+        // Ensure content-type attribute is stored
+        if !attributes.contains_key(oo7::CONTENT_TYPE_ATTRIBUTE) {
+            attributes.insert(
+                oo7::CONTENT_TYPE_ATTRIBUTE.to_owned(),
+                content_type.as_str().to_owned(),
+            );
+        }
+
+        let item = keyring
+            .create_item(label, &attributes, secret, replace)
+            .await
+            .map_err(|err| custom_service_error(&format!("Failed to create a new item {err}.")))?;
+
+        let key = keyring
+            .key()
+            .await
+            .map_err(|err| custom_service_error(&format!("Failed to derive key: {err}")))?;
+        drop(keyring_guard);
+
+        let n_items = *self.item_index.read().await;
+        let item_path = OwnedObjectPath::try_from(format!("{}/{n_items}", self.path)).unwrap();
+
+        let item = item::Item::new(
+            item.into(),
+            self.service.clone(),
+            self.path.clone(),
+            item_path.clone(),
+        );
+        *self.item_index.write().await = n_items + 1;
+
+        let object_server = self.service.object_server();
+        let signal_emitter = self.service.signal_emitter(&self.path)?;
+
+        // Remove any existing items with the same attributes
+        if replace {
+            let existing_items = self
+                .search_items_exact_with_key(&attributes, key.as_deref())
+                .await?;
+            if !existing_items.is_empty() {
+                let mut items = self.items.lock().await;
+                for existing in &existing_items {
+                    let existing_path = existing.path();
+
+                    items.retain(|i| i.path() != existing_path);
+                    object_server.remove::<item::Item, _>(existing_path).await?;
+                    Self::item_deleted(&signal_emitter, existing_path).await?;
+
+                    tracing::debug!("Replaced item `{}`", existing_path);
+                }
+                drop(items);
+            }
+        }
+
+        self.items.lock().await.push(item.clone());
+
+        object_server.at(&item_path, item).await?;
+
+        // It knows the secret it stored.
+        if let Some(client) = &client {
+            self.service
+                .grant_access(client, std::slice::from_ref(&item_path))
+                .await;
+        }
+
+        self.update_modified().await?;
+
+        Self::item_created(&signal_emitter, &item_path).await?;
+        self.items_changed(&signal_emitter).await?;
+
+        match session.peer_info() {
+            Some(info) => tracing::info!(
+                "Item `{item_path}` created by {} ({info}).",
+                session.sender()
+            ),
+            None => tracing::info!("Item `{item_path}` created by {}.", session.sender()),
+        }
+
+        Ok(item_path)
+    }
+
     pub async fn new(
         name: &str,
         label: &str,
@@ -479,6 +532,15 @@ impl Collection {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Whether the keyring is locked and has no file yet: the default keyring
+    /// before its first item, which no password opens yet.
+    pub async fn is_new(&self) -> bool {
+        match self.keyring.read().await.as_ref() {
+            Some(Keyring::Locked(keyring)) => keyring.path().is_some_and(|path| !path.exists()),
+            _ => false,
+        }
     }
 
     pub async fn set_alias(&self, alias: &str) {

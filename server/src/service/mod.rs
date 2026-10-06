@@ -1,7 +1,9 @@
 // org.freedesktop.Secret.Service
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    os::fd::AsFd,
+    path::PathBuf,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicU32, Ordering},
@@ -16,10 +18,11 @@ use oo7::{
     },
     file::{Keyring, LockedKeyring, UnlockedKeyring},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio_stream::StreamExt;
 use zbus::{
-    names::UniqueName,
+    message::Header,
+    names::{BusName, OwnedUniqueName, UniqueName},
     object_server::SignalEmitter,
     proxy::Defaults,
     zvariant::{ObjectPath, Optional, OwnedObjectPath, OwnedValue, Value},
@@ -32,9 +35,11 @@ use crate::plasma::prompter::in_plasma_environment;
 use crate::{
     collection::Collection,
     error::{Error, custom_service_error},
+    item::Item,
     migration::{self, PendingMigration},
-    prompt::{Prompt, PromptAction, PromptRole},
+    prompt::{AccessStep, Prompt, PromptAction, PromptRole},
     session::{PeerInfo, Session, SessionType},
+    socket_prompter::{self, Caller, Operation},
 };
 
 const DEFAULT_COLLECTION_ALIAS_PATH: ObjectPath<'static> =
@@ -47,6 +52,36 @@ pub enum PrompterType {
     GNOME,
     Plasma,
     Cli,
+}
+
+/// How the daemon was started, beyond what upstream oo7 does by default.
+#[derive(Debug, Default, Clone)]
+pub struct Options {
+    /// Items are locked for each client until that client is allowed to use
+    /// them through an access prompt; see [`Service::may_access`]. Needs the
+    /// socket prompter, the only one that can ask for access.
+    pub per_client_access: bool,
+    /// Prompts go to the prompter listening on this unix socket instead of
+    /// GNOME's or Plasma's; see [`crate::socket_prompter`].
+    pub prompter_socket: Option<PathBuf>,
+}
+
+/// The unique bus name of the client that sent a message.
+///
+/// On a peer-to-peer connection there is no bus to set it, and tests use a
+/// fixed one unless the message names its sender itself.
+pub(crate) fn client_of(header: &Header<'_>) -> Option<OwnedUniqueName> {
+    if let Some(sender) = header.sender() {
+        return Some(sender.to_owned().into());
+    }
+    #[cfg(test)]
+    {
+        Some(UniqueName::try_from(":p2p.test").unwrap().into())
+    }
+    #[cfg(not(test))]
+    {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -71,6 +106,14 @@ pub struct Service {
     pub(crate) pam_socket: Option<std::path::PathBuf>,
     // Override for prompter type (mainly for tests)
     pub(crate) prompter_type_override: Arc<Mutex<Option<PrompterType>>>,
+    options: Arc<std::sync::RwLock<Options>>,
+    // items each client was allowed to use, by unique bus name; dropped when
+    // the client leaves the bus
+    access: Arc<Mutex<HashMap<OwnedUniqueName, HashSet<OwnedObjectPath>>>>,
+    // keyrings being unlocked because a search found them locked: collection
+    // path -> the outcome, `None` while the prompter is still asking
+    #[allow(clippy::type_complexity)]
+    search_unlocks: Arc<Mutex<HashMap<OwnedObjectPath, watch::Receiver<Option<bool>>>>>,
 }
 
 #[zbus::interface(name = "org.freedesktop.Secret.Service")]
@@ -225,7 +268,11 @@ impl Service {
     pub async fn search_items(
         &self,
         attributes: HashMap<String, String>,
+        #[zbus(header)] header: Header<'_>,
     ) -> Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>), ServiceError> {
+        let client = client_of(&header);
+        self.unlock_keyrings_for_search(client.as_ref()).await?;
+
         let mut unlocked = Vec::new();
         let mut locked = Vec::new();
         let collections = self.collections.lock().await;
@@ -233,7 +280,7 @@ impl Service {
         for collection in collections.values() {
             let items = collection.search_inner_items(&attributes).await?;
             for item in items {
-                if item.is_locked().await {
+                if item.is_locked().await || !self.may_access(client.as_ref(), item.path()).await {
                     locked.push(item.path().clone().into());
                 } else {
                     unlocked.push(item.path().clone().into());
@@ -257,137 +304,9 @@ impl Service {
     pub async fn unlock(
         &self,
         objects: Vec<OwnedObjectPath>,
+        #[zbus(header)] header: Header<'_>,
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath), ServiceError> {
-        tracing::info!("Unlock requested for {} objects.", objects.len());
-        let (unlocked, not_unlocked) = self.set_locked(false, &objects).await?;
-        if !not_unlocked.is_empty() {
-            // Extract the label and collection before creating the prompt
-            let label = self.extract_label_from_objects(&not_unlocked).await;
-            let collection = self.extract_collection_from_objects(&not_unlocked).await;
-
-            let prompt = Prompt::new(self.clone(), PromptRole::Unlock, label, collection).await;
-            let path = OwnedObjectPath::from(prompt.path().clone());
-
-            // Create the unlock action
-            let service = self.clone();
-            let action = PromptAction::new(move |secret: Option<Secret>| async move {
-                // The prompter will handle secret validation
-                // Here we just perform the unlock operation
-
-                // First, check for pending migrations (without holding
-                // collections lock)
-                for object in &not_unlocked {
-                    let collection = {
-                        let collections = service.collections.lock().await;
-                        collections.get(object).cloned()
-                    };
-
-                    if let Some(collection) = collection {
-                        // Check if this collection has a pending migration by
-                        // name
-                        let migration_opt = {
-                            let pending = service.pending_migrations.lock().await;
-                            pending.get(collection.name()).cloned()
-                        };
-
-                        if let Some(migration) = migration_opt {
-                            let migration_name = migration.name();
-                            tracing::debug!(
-                                "Attempting migration for '{}' during unlock",
-                                migration_name
-                            );
-
-                            // Attempt migration with the provided secret (no
-                            // locks held)
-                            match migration.migrate(&service.data_dir, secret.as_ref()).await {
-                                Ok(unlocked_keyring) => {
-                                    tracing::info!(
-                                        "Successfully migrated '{}' during unlock",
-                                        migration_name
-                                    );
-
-                                    // Replace the keyring in the collection
-                                    let mut keyring_guard = collection.keyring.write().await;
-                                    *keyring_guard = Some(Keyring::Unlocked(unlocked_keyring));
-                                    drop(keyring_guard);
-
-                                    // Dispatch items from the migrated keyring
-                                    if let Err(e) = collection.dispatch_items().await {
-                                        tracing::error!(
-                                            "Failed to dispatch items after migration: {}",
-                                            e
-                                        );
-                                    }
-
-                                    // Remove from pending migrations
-                                    service
-                                        .pending_migrations
-                                        .lock()
-                                        .await
-                                        .remove(migration_name);
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Failed to migrate '{}' during unlock: {}",
-                                        migration_name,
-                                        e
-                                    );
-                                    let _ = collection.set_locked(false, secret.clone()).await;
-                                }
-                            }
-                        } else {
-                            // Normal unlock
-                            let _ = collection.set_locked(false, secret.clone()).await;
-                        }
-                    } else {
-                        // Try to find as item within collections
-                        let collections = service.collections.lock().await;
-                        let mut found_collection = None;
-                        for collection in collections.values() {
-                            if let Some(item) = collection.item_from_path(object).await {
-                                found_collection = Some((
-                                    collection.clone(),
-                                    item.clone(),
-                                    collection.is_locked().await,
-                                ));
-                                break;
-                            }
-                        }
-                        drop(collections);
-
-                        if let Some((collection, item, is_locked)) = found_collection {
-                            if is_locked {
-                                let _ = collection.set_locked(false, secret.clone()).await;
-                            } else {
-                                let keyring = collection.keyring.read().await;
-                                match keyring.as_ref() {
-                                    Some(k) if !k.is_locked() => {
-                                        let _ = item.set_locked(false, k.as_unlocked()).await;
-                                    }
-                                    _ => {
-                                        drop(keyring);
-                                        let _ = collection.set_locked(false, secret.clone()).await;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(Value::new(not_unlocked).try_into_owned().unwrap())
-            });
-
-            prompt.set_action(action).await;
-
-            self.prompts
-                .lock()
-                .await
-                .insert(path.clone(), prompt.clone());
-
-            self.object_server().at(&path, prompt).await?;
-            return Ok((unlocked, path));
-        }
-
-        Ok((unlocked, OwnedObjectPath::default()))
+        self.unlock_for(client_of(&header), objects).await
     }
 
     #[zbus(out_args("locked", "Prompt"))]
@@ -410,19 +329,25 @@ impl Service {
         &self,
         items: Vec<OwnedObjectPath>,
         session: OwnedObjectPath,
+        #[zbus(header)] header: Header<'_>,
     ) -> Result<HashMap<OwnedObjectPath, DBusSecretInner>, ServiceError> {
         tracing::debug!(
             "GetSecrets called for {} items with session {}.",
             items.len(),
             session
         );
+        let client = client_of(&header);
         let mut secrets = HashMap::new();
         let collections = self.collections.lock().await;
 
         'outer: for collection in collections.values() {
             for item in &items {
                 if let Some(item) = collection.item_from_path(item).await {
-                    match item.get_secret(session.clone()).await {
+                    // Not allowed for this client: as if it were locked.
+                    if !self.may_access(client.as_ref(), item.path()).await {
+                        continue;
+                    }
+                    match item.secret(session.clone()).await {
                         Ok((secret,)) => {
                             secrets.insert(item.path().clone().into(), secret);
                             // To avoid iterating through all the remaining
@@ -571,12 +496,16 @@ impl Service {
             data_dir,
             pam_socket,
             prompter_type_override: Arc::new(Mutex::new(None)),
+            options: Default::default(),
+            access: Default::default(),
+            search_unlocks: Default::default(),
         }
     }
 
     pub async fn run(
         secret: Option<Secret>,
         request_replacement: bool,
+        options: Options,
     ) -> Result<zbus::Connection, Error> {
         // Compute data directory from environment variables
         let data_dir = std::env::var_os("XDG_DATA_HOME")
@@ -600,6 +529,7 @@ impl Service {
         let pam_socket = std::env::var_os("OO7_PAM_SOCKET").map(std::path::PathBuf::from);
 
         let service = Self::new(data_dir, pam_socket);
+        service.set_options(options);
 
         // Start PAM listener early so it can buffer secrets arriving before
         // D-Bus is ready (e.g. during PAM-initiated login startup).
@@ -1149,6 +1079,7 @@ impl Service {
             let old_owner = old_owner
                 .as_ref()
                 .expect("A disconnected client requires an old_owner");
+            self.revoke_access(old_owner).await;
             if let Some(session) = self.session_from_sender(old_owner).await {
                 let client_name = match session.peer_info() {
                     Some(info) => format!("{old_owner} ({info})"),
@@ -1163,6 +1094,476 @@ impl Service {
             }
         }
         Ok(())
+    }
+
+    /// Unlock `objects` for `client`: what [`Self::unlock`] does, callable
+    /// without a message header.
+    pub async fn unlock_for(
+        &self,
+        client: Option<OwnedUniqueName>,
+        objects: Vec<OwnedObjectPath>,
+    ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath), ServiceError> {
+        if self.per_client_access() {
+            return self.unlock_for_client(client, objects).await;
+        }
+
+        tracing::info!("Unlock requested for {} objects.", objects.len());
+        let (unlocked, not_unlocked) = self.set_locked(false, &objects).await?;
+        if !not_unlocked.is_empty() {
+            // Extract the label and collection before creating the prompt
+            let label = self.extract_label_from_objects(&not_unlocked).await;
+            let collection = self.extract_collection_from_objects(&not_unlocked).await;
+
+            let prompt = Prompt::new(self.clone(), PromptRole::Unlock, label, collection).await;
+            let path = OwnedObjectPath::from(prompt.path().clone());
+
+            // Create the unlock action
+            let service = self.clone();
+            let action = PromptAction::new(move |secret: Option<Secret>| async move {
+                // The prompter will handle secret validation
+                // Here we just perform the unlock operation
+
+                // First, check for pending migrations (without holding
+                // collections lock)
+                for object in &not_unlocked {
+                    let collection = {
+                        let collections = service.collections.lock().await;
+                        collections.get(object).cloned()
+                    };
+
+                    if let Some(collection) = collection {
+                        // Check if this collection has a pending migration by
+                        // name
+                        let migration_opt = {
+                            let pending = service.pending_migrations.lock().await;
+                            pending.get(collection.name()).cloned()
+                        };
+
+                        if let Some(migration) = migration_opt {
+                            let migration_name = migration.name();
+                            tracing::debug!(
+                                "Attempting migration for '{}' during unlock",
+                                migration_name
+                            );
+
+                            // Attempt migration with the provided secret (no
+                            // locks held)
+                            match migration.migrate(&service.data_dir, secret.as_ref()).await {
+                                Ok(unlocked_keyring) => {
+                                    tracing::info!(
+                                        "Successfully migrated '{}' during unlock",
+                                        migration_name
+                                    );
+
+                                    // Replace the keyring in the collection
+                                    let mut keyring_guard = collection.keyring.write().await;
+                                    *keyring_guard = Some(Keyring::Unlocked(unlocked_keyring));
+                                    drop(keyring_guard);
+
+                                    // Dispatch items from the migrated keyring
+                                    if let Err(e) = collection.dispatch_items().await {
+                                        tracing::error!(
+                                            "Failed to dispatch items after migration: {}",
+                                            e
+                                        );
+                                    }
+
+                                    // Remove from pending migrations
+                                    service
+                                        .pending_migrations
+                                        .lock()
+                                        .await
+                                        .remove(migration_name);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to migrate '{}' during unlock: {}",
+                                        migration_name,
+                                        e
+                                    );
+                                    let _ = collection.set_locked(false, secret.clone()).await;
+                                }
+                            }
+                        } else {
+                            // Normal unlock
+                            let _ = collection.set_locked(false, secret.clone()).await;
+                        }
+                    } else {
+                        // Try to find as item within collections
+                        let collections = service.collections.lock().await;
+                        let mut found_collection = None;
+                        for collection in collections.values() {
+                            if let Some(item) = collection.item_from_path(object).await {
+                                found_collection = Some((
+                                    collection.clone(),
+                                    item.clone(),
+                                    collection.is_locked().await,
+                                ));
+                                break;
+                            }
+                        }
+                        drop(collections);
+
+                        if let Some((collection, item, is_locked)) = found_collection {
+                            if is_locked {
+                                let _ = collection.set_locked(false, secret.clone()).await;
+                            } else {
+                                let keyring = collection.keyring.read().await;
+                                match keyring.as_ref() {
+                                    Some(k) if !k.is_locked() => {
+                                        let _ = item.set_locked(false, k.as_unlocked()).await;
+                                    }
+                                    _ => {
+                                        drop(keyring);
+                                        let _ = collection.set_locked(false, secret.clone()).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Value::new(not_unlocked).try_into_owned().unwrap())
+            });
+
+            prompt.set_action(action).await;
+
+            self.prompts
+                .lock()
+                .await
+                .insert(path.clone(), prompt.clone());
+
+            self.object_server().at(&path, prompt).await?;
+            return Ok((unlocked, path));
+        }
+
+        Ok((unlocked, OwnedObjectPath::default()))
+    }
+
+    /// [`Self::unlock_for`] with per-client access: an item is unlocked for
+    /// `client` once its keyring is unlocked and the client was allowed to use
+    /// it. One prompt asks for whatever is missing: the keyring's password
+    /// first if it is locked, then whether the client may use the items.
+    async fn unlock_for_client(
+        &self,
+        client: Option<OwnedUniqueName>,
+        objects: Vec<OwnedObjectPath>,
+    ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath), ServiceError> {
+        let Some(client) = client else {
+            return Err(custom_service_error("The client has no bus name."));
+        };
+
+        let mut unlocked = Vec::new();
+        let mut pending = Vec::new();
+        let mut locked_collection = None;
+        for object in objects {
+            if let Some(collection) = self.collection_from_path(&object).await {
+                if collection.is_locked().await {
+                    locked_collection.get_or_insert(collection);
+                    pending.push(object);
+                } else {
+                    unlocked.push(object);
+                }
+            } else if let Some((collection, _item)) = self.item_from_path(&object).await {
+                if collection.is_locked().await {
+                    locked_collection.get_or_insert(collection);
+                    pending.push(object);
+                } else if self.may_access(Some(&client), &object).await {
+                    unlocked.push(object);
+                } else {
+                    pending.push(object);
+                }
+            } else {
+                tracing::warn!("Object: {} does not exist.", object);
+            }
+        }
+
+        if pending.is_empty() {
+            return Ok((unlocked, OwnedObjectPath::default()));
+        }
+
+        let (role, collection) = match locked_collection {
+            Some(collection) => (PromptRole::Unlock, Some(collection)),
+            None => (
+                PromptRole::Access,
+                self.extract_collection_from_objects(&pending).await,
+            ),
+        };
+        let label = match &collection {
+            Some(collection) => collection.label().await,
+            None => String::new(),
+        };
+        let prompt = Prompt::new(self.clone(), role, label, collection)
+            .await
+            .with_client(client)
+            .with_access(AccessStep {
+                operation: Operation::Read,
+                objects: pending.clone(),
+            });
+        let path = OwnedObjectPath::from(prompt.path().clone());
+
+        // The socket prompter unlocked the keyring and recorded the access
+        // before it runs this.
+        let action = PromptAction::new(move |_secret: Option<Secret>| async move {
+            Ok(Value::new(pending).try_into_owned().unwrap())
+        });
+        prompt.set_action(action).await;
+
+        self.register_prompt(path.clone(), prompt.clone()).await;
+        self.object_server().at(&path, prompt).await?;
+
+        Ok((unlocked, path))
+    }
+
+    pub fn set_options(&self, options: Options) {
+        *self.options.write().unwrap() = options;
+    }
+
+    pub fn per_client_access(&self) -> bool {
+        self.options.read().unwrap().per_client_access
+    }
+
+    pub fn prompter_socket(&self) -> Option<PathBuf> {
+        self.options.read().unwrap().prompter_socket.clone()
+    }
+
+    /// Whether `client` may use `item`. Always with per-client access off;
+    /// otherwise once an access prompt allowed it, until the client leaves the
+    /// bus. Says nothing about the item's keyring being unlocked.
+    pub async fn may_access(
+        &self,
+        client: Option<&OwnedUniqueName>,
+        item: &ObjectPath<'_>,
+    ) -> bool {
+        if !self.per_client_access() {
+            return true;
+        }
+        let Some(client) = client else {
+            return false;
+        };
+        self.access
+            .lock()
+            .await
+            .get(client)
+            .is_some_and(|items| items.contains(&OwnedObjectPath::from(item.to_owned())))
+    }
+
+    pub async fn grant_access(&self, client: &OwnedUniqueName, items: &[OwnedObjectPath]) {
+        if !self.per_client_access() {
+            return;
+        }
+        tracing::info!("Client {client} allowed to use {} item(s).", items.len());
+        self.access
+            .lock()
+            .await
+            .entry(client.clone())
+            .or_default()
+            .extend(items.iter().cloned());
+    }
+
+    pub async fn revoke_access(&self, client: &UniqueName<'_>) {
+        let client = OwnedUniqueName::from(client.to_owned());
+        if self.access.lock().await.remove(&client).is_some() {
+            tracing::info!("Client {client} left, its access is dropped.");
+        }
+    }
+
+    /// The objects of an access step the client still has to be allowed:
+    /// items it may not use yet when reading, every object when deleting.
+    pub(crate) async fn needs_access(
+        &self,
+        client: &OwnedUniqueName,
+        step: &AccessStep,
+    ) -> Vec<OwnedObjectPath> {
+        let mut needed = Vec::new();
+        for object in &step.objects {
+            match step.operation {
+                Operation::Delete => needed.push(object.clone()),
+                Operation::Read => {
+                    if self.item_from_path(object).await.is_some()
+                        && !self.may_access(Some(client), object).await
+                    {
+                        needed.push(object.clone());
+                    }
+                }
+            }
+        }
+        needed
+    }
+
+    /// What an access prompt shows for `objects`: an item's label, or a
+    /// collection's.
+    pub(crate) async fn labels_of(&self, objects: &[OwnedObjectPath]) -> Vec<String> {
+        let mut labels = Vec::new();
+        for object in objects {
+            if let Some((_collection, item)) = self.item_from_path(object).await {
+                labels.push(item.label().await.unwrap_or_else(|_| object.to_string()));
+            } else if let Some(collection) = self.collection_from_path(object).await {
+                labels.push(collection.label().await);
+            }
+        }
+        labels
+    }
+
+    pub(crate) async fn item_from_path(&self, path: &ObjectPath<'_>) -> Option<(Collection, Item)> {
+        let collections = self.collections.lock().await;
+        for collection in collections.values() {
+            if let Some(item) = collection.item_from_path(path).await {
+                return Some((collection.clone(), item));
+            }
+        }
+        None
+    }
+
+    /// The client a prompt is for, with its pid and pidfd: from the bus
+    /// (`GetConnectionCredentials`), or from the socket on a peer-to-peer
+    /// connection.
+    pub(crate) async fn caller(&self, client: Option<&OwnedUniqueName>) -> Caller {
+        let connection = self.connection();
+        let from = |credentials: &zbus::fdo::ConnectionCredentials| Caller {
+            bus_name: client.cloned(),
+            pid: credentials.process_id(),
+            pidfd: credentials
+                .process_fd()
+                .and_then(|fd| fd.as_fd().try_clone_to_owned().ok()),
+        };
+
+        if connection.is_bus() {
+            let Some(client) = client else {
+                return Caller::default();
+            };
+            let credentials = match zbus::fdo::DBusProxy::new(connection).await {
+                Ok(proxy) => {
+                    proxy
+                        .get_connection_credentials(BusName::from((**client).clone()))
+                        .await
+                }
+                Err(err) => Err(err.into()),
+            };
+            match credentials {
+                Ok(credentials) => from(&credentials),
+                Err(err) => {
+                    tracing::warn!("Failed to get the credentials of {client}: {err}");
+                    Caller {
+                        bus_name: Some(client.clone()),
+                        ..Default::default()
+                    }
+                }
+            }
+        } else {
+            match connection.peer_creds().await {
+                Ok(credentials) => from(credentials),
+                Err(err) => {
+                    tracing::warn!("Failed to get the peer's credentials: {err}");
+                    Caller {
+                        bus_name: client.cloned(),
+                        ..Default::default()
+                    }
+                }
+            }
+        }
+    }
+
+    /// With the socket prompter, a search that finds a keyring locked asks for
+    /// its password and waits for it, instead of answering that nothing
+    /// matches: a locked keyring cannot be searched (its attributes are hashed
+    /// with a key derived from the password), and an empty answer makes clients
+    /// store a new secret over the one they could not see. Refused, the search
+    /// fails with `IsLocked`. A keyring with no file yet has nothing to find,
+    /// so it is not asked for.
+    async fn unlock_keyrings_for_search(
+        &self,
+        client: Option<&OwnedUniqueName>,
+    ) -> Result<(), ServiceError> {
+        if self.prompter_socket().is_none() {
+            return Ok(());
+        }
+
+        let mut locked = Vec::new();
+        for collection in self.collections.lock().await.values() {
+            if collection.is_locked().await && !collection.is_new().await {
+                locked.push(collection.clone());
+            }
+        }
+
+        for collection in locked {
+            if !self.unlock_for_search(&collection, client).await {
+                return Err(ServiceError::IsLocked(format!(
+                    "The keyring `{}` is locked.",
+                    collection.label().await
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Unlock `collection` through the socket prompter, once for all the
+    /// searches that wait on it at the same time.
+    async fn unlock_for_search(
+        &self,
+        collection: &Collection,
+        client: Option<&OwnedUniqueName>,
+    ) -> bool {
+        let path = OwnedObjectPath::from(collection.path().to_owned());
+        let mut outcome = {
+            let mut unlocks = self.search_unlocks.lock().await;
+            match unlocks.get(&path) {
+                Some(outcome) => outcome.clone(),
+                None => {
+                    let (sender, outcome) = watch::channel(None);
+                    unlocks.insert(path.clone(), outcome.clone());
+
+                    let caller = self.caller(client).await;
+                    let service = self.clone();
+                    let collection = collection.clone();
+                    // Spawned: the keyring is unlocked even if the client that
+                    // searched has given up waiting.
+                    tokio::spawn(async move {
+                        let unlocked = service.ask_unlock(&collection, caller).await;
+                        service.search_unlocks.lock().await.remove(&path);
+                        let _ = sender.send(Some(unlocked));
+                    });
+                    outcome
+                }
+            }
+        };
+
+        match outcome.wait_for(Option::is_some).await {
+            Ok(unlocked) => unlocked.unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    async fn ask_unlock(&self, collection: &Collection, caller: Caller) -> bool {
+        let Some(socket) = self.prompter_socket() else {
+            return false;
+        };
+        let mut session = match socket_prompter::Session::connect(&socket, caller).await {
+            Ok(session) => session,
+            Err(err) => {
+                tracing::error!(
+                    "Failed to reach the prompter at {}: {err}",
+                    socket.display()
+                );
+                return false;
+            }
+        };
+        let label = collection.label().await;
+        match crate::prompt::ask_password(
+            &mut session,
+            PromptRole::Unlock,
+            &label,
+            None,
+            Some(collection),
+            None,
+        )
+        .await
+        {
+            Ok(secret) => secret.is_some(),
+            Err(err) => {
+                tracing::error!("Failed to unlock {label} for a search: {err}");
+                false
+            }
+        }
     }
 
     async fn cleanup_stale_sessions(&self) {

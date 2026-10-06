@@ -1,4 +1,7 @@
 #![deny(unsafe_code)]
+
+#[cfg(test)]
+mod access_tests;
 mod capability;
 mod collection;
 mod error;
@@ -12,6 +15,7 @@ mod plasma;
 mod prompt;
 mod service;
 mod session;
+mod socket_prompter;
 #[cfg(test)]
 mod tests;
 
@@ -53,6 +57,18 @@ struct Args {
         help = "Print debug information during command processing."
     )]
     is_verbose: bool,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Send prompts to the prompter listening on this unix socket, instead of GNOME's or Plasma's."
+    )]
+    prompter_socket: Option<std::path::PathBuf>,
+    #[arg(
+        long,
+        requires = "prompter_socket",
+        help = "Lock items for each client until the prompter allows that client to use them."
+    )]
+    per_client_access: bool,
 }
 
 fn read_secret_from_login_helper() -> Option<oo7::Secret> {
@@ -151,7 +167,12 @@ async fn inner_main(args: Args) -> Result<(), Error> {
 
     tracing::info!("Starting {BINARY_NAME}");
 
-    let connection = match Service::run(secret, args.replace).await {
+    let options = service::Options {
+        per_client_access: args.per_client_access,
+        prompter_socket: args.prompter_socket,
+    };
+
+    let connection = match Service::run(secret, args.replace, options).await {
         Ok(connection) => connection,
         Err(Error::File(oo7::file::Error::IncorrectSecret)) if !args.login => {
             tracing::warn!("Failed to unlock session keyring: credential contains wrong password");

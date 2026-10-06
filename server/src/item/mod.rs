@@ -4,9 +4,19 @@ use std::{collections::HashMap, sync::Arc};
 
 use oo7::dbus::{ServiceError, api::DBusSecretInner};
 use tokio::sync::Mutex;
-use zbus::zvariant::{ObjectPath, OwnedObjectPath};
+use zbus::{
+    message::Header,
+    zvariant::{ObjectPath, OwnedObjectPath},
+};
 
-use crate::{Service, collection::Collection, error::custom_service_error};
+use crate::{
+    Service,
+    collection::Collection,
+    error::custom_service_error,
+    prompt::{AccessStep, PromptRole},
+    service::client_of,
+    socket_prompter::Operation,
+};
 
 #[derive(Clone)]
 pub struct Item {
@@ -23,7 +33,7 @@ impl Item {
     #[zbus(out_args("Prompt"))]
     pub async fn delete(
         &self,
-        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(header)] header: Header<'_>,
     ) -> Result<OwnedObjectPath, ServiceError> {
         let caller = if let Some(sender) = header.sender() {
             self.service.peer_display_name(sender).await
@@ -41,16 +51,34 @@ impl Item {
             )));
         };
 
+        // With per-client access, deleting always asks, even a client allowed
+        // to read the item.
+        let ask_access = self.service.per_client_access();
+        let locked = self.is_locked().await || collection.is_locked().await;
         // Check if item or collection is locked
-        if self.is_locked().await || collection.is_locked().await {
+        if locked || ask_access {
             // Create a prompt to unlock and delete the item
-            let prompt = crate::prompt::Prompt::new(
+            let role = if locked {
+                PromptRole::Unlock
+            } else {
+                PromptRole::Access
+            };
+            let mut prompt = crate::prompt::Prompt::new(
                 self.service.clone(),
-                crate::prompt::PromptRole::Unlock,
+                role,
                 collection.label().await,
                 Some(collection.clone()),
             )
             .await;
+            if ask_access {
+                let Some(client) = client_of(&header) else {
+                    return Err(custom_service_error("The client has no bus name."));
+                };
+                prompt = prompt.with_client(client).with_access(AccessStep {
+                    operation: Operation::Delete,
+                    objects: vec![self.path.clone()],
+                });
+            }
             let prompt_path = OwnedObjectPath::from(prompt.path().clone());
 
             let item_self = self.clone();
@@ -100,54 +128,18 @@ impl Item {
     pub async fn get_secret(
         &self,
         session: OwnedObjectPath,
+        #[zbus(header)] header: Header<'_>,
     ) -> Result<(DBusSecretInner,), ServiceError> {
-        let Some(session) = self.service.session(&session).await else {
-            tracing::error!("The session `{}` does not exist.", session);
-            return Err(ServiceError::NoSession(format!(
-                "The session `{session}` does not exist."
-            )));
-        };
-
-        let inner = self.inner.lock().await;
-        let inner = inner.as_ref().unwrap();
-        if inner.is_locked() {
-            tracing::error!("Cannot get secret of a locked object `{}`", self.path);
-            return Err(ServiceError::IsLocked(format!(
-                "Cannot get secret of a locked object `{}`.",
-                self.path
-            )));
-        }
-        let secret = inner.as_unlocked().secret();
-        let content_type = secret.content_type();
-
-        tracing::debug!("Secret retrieved from the item: {}.", self.path);
-
-        match session.aes_key() {
-            Some(key) => {
-                let iv = oo7::crypto::generate_iv().map_err(|err| {
-                    custom_service_error(&format!("Failed to generate iv {err}."))
-                })?;
-                let encrypted = oo7::crypto::encrypt(secret, &key, &iv).map_err(|err| {
-                    custom_service_error(&format!("Failed to encrypt secret {err}."))
-                })?;
-
-                Ok((DBusSecretInner(
-                    session.path().clone().into(),
-                    iv,
-                    encrypted,
-                    content_type,
-                ),))
-            }
-            None => Ok((DBusSecretInner(
-                session.path().clone().into(),
-                Vec::new(),
-                secret.to_vec(),
-                content_type,
-            ),)),
-        }
+        self.check_access(&header).await?;
+        self.secret(session).await
     }
 
-    pub async fn set_secret(&self, secret: DBusSecretInner) -> Result<(), ServiceError> {
+    pub async fn set_secret(
+        &self,
+        secret: DBusSecretInner,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(), ServiceError> {
+        self.check_access(&header).await?;
         let DBusSecretInner(ref session, ref iv, ref secret, ref content_type) = secret;
 
         let Some(session) = self.service.session(session).await else {
@@ -212,9 +204,25 @@ impl Item {
         Ok(())
     }
 
+    /// Locked with its keyring, and with per-client access, for a client not
+    /// allowed to use it yet. Its label and attributes stay readable while the
+    /// keyring is unlocked, as KeePassXC does: clients load them before asking
+    /// to unlock.
     #[zbus(property, name = "Locked")]
-    pub async fn is_locked(&self) -> bool {
-        self.inner.lock().await.as_ref().unwrap().is_locked()
+    pub async fn locked(&self, #[zbus(header)] header: Option<Header<'_>>) -> bool {
+        if self.is_locked().await {
+            return true;
+        }
+        match header {
+            Some(header) => {
+                !self
+                    .service
+                    .may_access(client_of(&header).as_ref(), &self.path)
+                    .await
+            }
+            // A signal: the state every allowed client sees.
+            None => false,
+        }
     }
 
     #[zbus(property, name = "Attributes")]
@@ -240,7 +248,13 @@ impl Item {
     pub async fn set_attributes(
         &self,
         attributes: HashMap<String, String>,
+        #[zbus(header)] header: Option<Header<'_>>,
     ) -> Result<(), zbus::Error> {
+        if let Some(header) = &header {
+            self.check_access(header).await.map_err(|err| {
+                zbus::Error::FDO(Box::new(zbus::fdo::Error::Failed(err.to_string())))
+            })?;
+        }
         {
             let mut inner = self.inner.lock().await;
             let inner = inner.as_mut().unwrap();
@@ -285,7 +299,16 @@ impl Item {
     }
 
     #[zbus(property, name = "Label")]
-    pub async fn set_label(&self, label: &str) -> Result<(), zbus::Error> {
+    pub async fn set_label(
+        &self,
+        label: &str,
+        #[zbus(header)] header: Option<Header<'_>>,
+    ) -> Result<(), zbus::Error> {
+        if let Some(header) = &header {
+            self.check_access(header).await.map_err(|err| {
+                zbus::Error::FDO(Box::new(zbus::fdo::Error::Failed(err.to_string())))
+            })?;
+        }
         {
             let mut inner = self.inner.lock().await;
             let inner = inner.as_mut().unwrap();
@@ -343,6 +366,74 @@ impl Item {
 }
 
 impl Item {
+    /// The secret, for whoever may read it: `GetSecret` once the access is checked.
+    pub async fn secret(
+        &self,
+        session: OwnedObjectPath,
+    ) -> Result<(DBusSecretInner,), ServiceError> {
+        let Some(session) = self.service.session(&session).await else {
+            tracing::error!("The session `{}` does not exist.", session);
+            return Err(ServiceError::NoSession(format!(
+                "The session `{session}` does not exist."
+            )));
+        };
+
+        let inner = self.inner.lock().await;
+        let inner = inner.as_ref().unwrap();
+        if inner.is_locked() {
+            tracing::error!("Cannot get secret of a locked object `{}`", self.path);
+            return Err(ServiceError::IsLocked(format!(
+                "Cannot get secret of a locked object `{}`.",
+                self.path
+            )));
+        }
+        let secret = inner.as_unlocked().secret();
+        let content_type = secret.content_type();
+
+        tracing::debug!("Secret retrieved from the item: {}.", self.path);
+
+        match session.aes_key() {
+            Some(key) => {
+                let iv = oo7::crypto::generate_iv().map_err(|err| {
+                    custom_service_error(&format!("Failed to generate iv {err}."))
+                })?;
+                let encrypted = oo7::crypto::encrypt(secret, &key, &iv).map_err(|err| {
+                    custom_service_error(&format!("Failed to encrypt secret {err}."))
+                })?;
+
+                Ok((DBusSecretInner(
+                    session.path().clone().into(),
+                    iv,
+                    encrypted,
+                    content_type,
+                ),))
+            }
+            None => Ok((DBusSecretInner(
+                session.path().clone().into(),
+                Vec::new(),
+                secret.to_vec(),
+                content_type,
+            ),)),
+        }
+    }
+
+    /// With per-client access, the sender may use this item only once allowed:
+    /// until then it is locked for it.
+    async fn check_access(&self, header: &Header<'_>) -> Result<(), ServiceError> {
+        if self
+            .service
+            .may_access(client_of(header).as_ref(), &self.path)
+            .await
+        {
+            return Ok(());
+        }
+        tracing::error!("The client may not use `{}`", self.path);
+        Err(ServiceError::IsLocked(format!(
+            "The object `{}` is locked for this client.",
+            self.path
+        )))
+    }
+
     pub fn new(
         item: oo7::file::Item,
         service: Service,
@@ -359,6 +450,11 @@ impl Item {
 
     pub fn path(&self) -> &ObjectPath<'_> {
         &self.path
+    }
+
+    /// Locked with its keyring, whoever asks.
+    pub async fn is_locked(&self) -> bool {
+        self.inner.lock().await.as_ref().unwrap().is_locked()
     }
 
     pub(crate) async fn set_locked(

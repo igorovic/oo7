@@ -203,6 +203,11 @@ impl PlasmaPrompterCallback {
                         .await
                 });
             }
+            PromptRole::Access => {
+                return Err(crate::error::custom_service_error(
+                    "Access prompts need the socket prompter.",
+                ));
+            }
         }
 
         Ok(())
@@ -242,6 +247,9 @@ impl PlasmaPrompterCallback {
                 prompt.on_change_password(secret).await?;
                 Ok(CallbackAction::Dismiss)
             }
+            PromptRole::Access => Err(crate::error::custom_service_error(
+                "Access prompts need the socket prompter.",
+            )),
         }
     }
 

@@ -15,7 +15,7 @@ use crate::gnome::{
 use crate::service::{PrompterType, Service};
 
 /// Helper to create a peer-to-peer connection pair using Unix socket
-async fn create_p2p_connection()
+pub(crate) async fn create_p2p_connection()
 -> Result<(zbus::Connection, zbus::Connection), Box<dyn std::error::Error>> {
     let guid = zbus::Guid::generate();
     let (p0, p1) = tokio::net::UnixStream::pair()?;
@@ -47,7 +47,7 @@ pub struct TestServiceSetup {
     #[cfg(any(feature = "plasma_native_crypto", feature = "plasma_openssl_crypto"))]
     pub(crate) mock_prompter_plasma: MockPrompterServicePlasma,
     // Keep temp dir alive for duration of test
-    _temp_dir: tempfile::TempDir,
+    pub(crate) _temp_dir: tempfile::TempDir,
 }
 
 impl TestServiceSetup {
@@ -829,4 +829,170 @@ impl MockPrompterServicePlasma {
         .await?;
         Ok(())
     }
+}
+
+/// What [`MockSocketPrompter`] answers to a request.
+#[derive(Debug, Clone)]
+pub(crate) enum SocketReply {
+    Allow,
+    Deny,
+    /// Handed back as the read end of a socketpair, as a real prompter does
+    Password(&'static str),
+    /// No answer: the request stays open until the daemon closes the connection
+    Hold,
+}
+
+/// A request [`MockSocketPrompter`] received.
+#[derive(Debug, Clone)]
+pub(crate) struct SocketRequest {
+    pub json: serde_json::Value,
+    /// The process behind the pidfd that came with the request, read from
+    /// `/proc/self/fdinfo`
+    pub pidfd_pid: Option<u32>,
+}
+
+/// Mock of the prompter behind `--prompter-socket`: listens on a socket in a
+/// temporary directory, answers each request with the next reply of its queue
+/// (`Deny` once it is empty), and records the requests.
+pub(crate) struct MockSocketPrompter {
+    pub path: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+    replies: Arc<std::sync::Mutex<std::collections::VecDeque<SocketReply>>>,
+    requests: Arc<std::sync::Mutex<Vec<SocketRequest>>>,
+    closed: Arc<tokio::sync::Notify>,
+}
+
+impl MockSocketPrompter {
+    pub fn new(replies: impl IntoIterator<Item = SocketReply>) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompter.socket");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let replies = Arc::new(std::sync::Mutex::new(replies.into_iter().collect()));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let closed = Arc::new(tokio::sync::Notify::new());
+
+        let (r, q, c) = (replies.clone(), requests.clone(), closed.clone());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(Self::serve(stream, r.clone(), q.clone(), c.clone()));
+            }
+        });
+
+        Self {
+            path,
+            _dir: dir,
+            replies,
+            requests,
+            closed,
+        }
+    }
+
+    pub fn set_replies(&self, replies: impl IntoIterator<Item = SocketReply>) {
+        *self.replies.lock().unwrap() = replies.into_iter().collect();
+    }
+
+    pub fn requests(&self) -> Vec<SocketRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    /// Wait until the daemon closes a connection.
+    pub async fn closed(&self) {
+        self.closed.notified().await
+    }
+
+    async fn serve(
+        stream: tokio::net::UnixStream,
+        replies: Arc<std::sync::Mutex<std::collections::VecDeque<SocketReply>>>,
+        requests: Arc<std::sync::Mutex<Vec<SocketRequest>>>,
+        closed: Arc<tokio::sync::Notify>,
+    ) {
+        use std::os::fd::{AsFd, AsRawFd};
+
+        use crate::socket_prompter::{read_line, send_line};
+
+        let mut pending = Vec::new();
+        loop {
+            let Ok(Some((line, fds))) = read_line(&stream, &mut pending).await else {
+                closed.notify_one();
+                return;
+            };
+            let pidfd_pid = fds.first().and_then(|fd| {
+                let fdinfo =
+                    std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd()))
+                        .ok()?;
+                fdinfo
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Pid:"))
+                    .and_then(|pid| pid.trim().parse().ok())
+            });
+            requests.lock().unwrap().push(SocketRequest {
+                json: serde_json::from_slice(&line).unwrap(),
+                pidfd_pid,
+            });
+
+            let reply = replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(SocketReply::Deny);
+            let sent = match reply {
+                SocketReply::Allow => send_line(&stream, b"{\"result\":\"allow\"}\n", None).await,
+                SocketReply::Deny => send_line(&stream, b"{\"result\":\"deny\"}\n", None).await,
+                SocketReply::Password(password) => {
+                    let (read_end, write_end) = socketpair(
+                        AddressFamily::UNIX,
+                        SocketType::STREAM,
+                        SocketFlags::CLOEXEC,
+                        None,
+                    )
+                    .unwrap();
+                    File::from(write_end)
+                        .write_all(password.as_bytes())
+                        .unwrap();
+                    send_line(
+                        &stream,
+                        b"{\"result\":\"password\"}\n",
+                        Some(read_end.as_fd()),
+                    )
+                    .await
+                }
+                SocketReply::Hold => Ok(()),
+            };
+            if sent.is_err() {
+                closed.notify_one();
+                return;
+            }
+        }
+    }
+}
+
+/// Call `method` on the service as the client `sender`: a second client on
+/// the same peer-to-peer connection, which has no bus to tell clients apart.
+pub(crate) async fn call_as<B>(
+    connection: &zbus::Connection,
+    sender: &str,
+    path: &ObjectPath<'_>,
+    interface: &str,
+    method: &str,
+    body: &B,
+) -> zbus::Result<zbus::Message>
+where
+    B: serde::Serialize + zbus::zvariant::DynamicType,
+{
+    let message = zbus::Message::method_call(path.clone(), method)?
+        .interface(interface)?
+        .sender(sender)?
+        .build(body)?;
+    let serial = message.primary_header().serial_num();
+    let mut stream = zbus::MessageStream::from(connection);
+    connection.send(&message).await?;
+    while let Some(reply) = stream.try_next().await? {
+        if reply.header().reply_serial() == Some(serial) {
+            return match reply.message_type() {
+                zbus::message::Type::Error => Err(zbus::Error::from(reply)),
+                _ => Ok(reply),
+            };
+        }
+    }
+    Err(zbus::Error::InvalidReply)
 }

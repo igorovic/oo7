@@ -1199,6 +1199,7 @@ dependencies = [
  "rpassword",
  "rustix",
  "serde",
+ "serde_json",
  "serde_repr",
  "sha2",
  "tempfile",

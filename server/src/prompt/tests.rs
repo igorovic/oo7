@@ -13,7 +13,10 @@ async fn prompt_called_twice_error_impl(
     // auto-trigger it)
     let (_unlocked, prompt_path) = setup
         .server
-        .unlock(vec![setup.collections[0].inner().path().to_owned().into()])
+        .unlock_for(
+            None,
+            vec![setup.collections[0].inner().path().to_owned().into()],
+        )
         .await?;
 
     // Verify we got a prompt path
@@ -62,7 +65,10 @@ async fn prompt_not_found_error() -> Result<(), Box<dyn std::error::Error>> {
     // Create a prompt using server API
     let (_unlocked, prompt_path) = setup
         .server
-        .unlock(vec![setup.collections[0].inner().path().to_owned().into()])
+        .unlock_for(
+            None,
+            vec![setup.collections[0].inner().path().to_owned().into()],
+        )
         .await?;
 
     assert!(!prompt_path.is_empty(), "Should have a prompt path");
@@ -116,7 +122,10 @@ async fn dismiss_prompt_cleanup() -> Result<(), Box<dyn std::error::Error>> {
     // Get a prompt path by calling unlock
     let (_unlocked, prompt_path) = setup
         .server
-        .unlock(vec![setup.collections[0].inner().path().to_owned().into()])
+        .unlock_for(
+            None,
+            vec![setup.collections[0].inner().path().to_owned().into()],
+        )
         .await?;
 
     assert!(!prompt_path.is_empty(), "Should have a prompt path");

@@ -15,6 +15,7 @@ pub(crate) mod plasma;
 pub(crate) mod prompt;
 pub(crate) mod service;
 pub(crate) mod session;
+pub(crate) mod socket_prompter;
 
 pub(crate) use service::Service;
 
