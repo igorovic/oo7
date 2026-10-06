@@ -533,8 +533,72 @@ async fn first_store_creates_the_keyring() -> Result<(), Box<dyn std::error::Err
     let requests = prompter.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].json["type"], "create");
+    // The card names who stores, though the password allows no read.
+    assert_eq!(requests[0].json["caller"]["bus_name"], ":p2p.test");
+    assert_eq!(requests[0].pidfd_pid, Some(std::process::id()));
+    assert!(requests[0].json.get("operation").is_none());
     assert!(keyring_file.exists());
     assert_eq!(item.secret(&setup.session).await?.value(), b"first");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_collection_names_its_caller() -> Result<(), Box<dyn std::error::Error>> {
+    let prompter = MockSocketPrompter::new([SocketReply::Password("work-keyring-password")]);
+    let (setup, _item) = setup_with_item(&prompter).await?;
+
+    let collection = setup
+        .service_api
+        .create_collection("Work", None, None)
+        .await?;
+    assert_eq!(collection.label().await?, "Work");
+    let requests = prompter.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].json["type"], "create");
+    assert_eq!(requests[0].json["caller"]["bus_name"], ":p2p.test");
+    assert_eq!(requests[0].pidfd_pid, Some(std::process::id()));
+    assert!(requests[0].json.get("operation").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn dismissed_store_completes_with_a_path() -> Result<(), Box<dyn std::error::Error>> {
+    use tokio_stream::StreamExt;
+
+    let prompter = MockSocketPrompter::new([SocketReply::Deny]);
+    let (setup, _data_dir) = setup_without_keyring(&prompter).await?;
+
+    // CreateItem by hand, to see the Completed signal itself: libsecret checks
+    // its result type before `dismissed`, and waits forever on an `ao`.
+    let collection = setup.default_collection().await?;
+    let secret = dbus::api::DBusSecret::new(Arc::clone(&setup.session), Secret::text("first"));
+    let (_item, prompt_path) = collection
+        .inner()
+        .call_method(
+            "CreateItem",
+            &(
+                dbus::api::Properties::for_item("First", &ATTRIBUTES),
+                &secret,
+                true,
+            ),
+        )
+        .await?
+        .body()
+        .deserialize::<(OwnedObjectPath, OwnedObjectPath)>()?;
+    let prompt = dbus::api::Prompt::new(&setup.client_conn, prompt_path)
+        .await?
+        .unwrap();
+    let mut completed = prompt.inner().receive_signal("Completed").await?;
+    prompt.prompt(None).await?;
+    let message = tokio::time::timeout(tokio::time::Duration::from_secs(2), completed.next())
+        .await?
+        .unwrap();
+    let (dismissed, result) = message
+        .body()
+        .deserialize::<(bool, zbus::zvariant::OwnedValue)>()?;
+    assert!(dismissed);
+    assert_eq!(result.value_signature(), "o", "CreateItem returns a path");
 
     Ok(())
 }

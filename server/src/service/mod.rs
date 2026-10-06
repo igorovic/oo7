@@ -217,18 +217,24 @@ impl Service {
         &self,
         properties: Properties,
         alias: &str,
+        #[zbus(header)] header: Header<'_>,
     ) -> Result<(OwnedObjectPath, ObjectPath<'_>), ServiceError> {
         let label = properties.label().to_owned();
         let alias = alias.to_owned();
 
         // Create a prompt to get the password for the new collection
-        let prompt = Prompt::new(
+        let mut prompt = Prompt::new(
             self.clone(),
             PromptRole::CreateCollection,
             label.clone(),
             None,
         )
         .await;
+        // Only to name the caller to the socket prompter.
+        if let Some(client) = client_of(&header) {
+            prompt = prompt.with_client(client);
+        }
+        let prompt = prompt.with_path_result();
         let prompt_path = OwnedObjectPath::from(prompt.path().clone());
 
         // Store the collection metadata for later creation

@@ -121,6 +121,11 @@ pub struct Prompt {
     client: Option<OwnedUniqueName>,
     /// Asked after the password, with per-client access
     access: Option<AccessStep>,
+    /// The result sent with a dismissal: of the type the method that made the
+    /// prompt returns on success, since libsecret checks the type before it
+    /// looks at `dismissed` (an `ao` for `CreateItem` left `secret-tool store`
+    /// waiting forever)
+    dismissed_result: fn() -> OwnedValue,
     /// Socket prompter specific: its conversation, aborted by `Dismiss`
     socket_started: Arc<AtomicBool>,
     socket_task: Arc<std::sync::Mutex<Option<AbortHandle>>>,
@@ -241,6 +246,7 @@ impl Prompt {
             action: Arc::new(Mutex::new(None)),
             client: None,
             access: None,
+            dismissed_result: empty_result,
             socket_started: Default::default(),
             socket_task: Default::default(),
         }
@@ -248,6 +254,13 @@ impl Prompt {
 
     pub fn with_client(mut self, client: OwnedUniqueName) -> Self {
         self.client = Some(client);
+        self
+    }
+
+    /// For a method whose prompt completes with one object path
+    /// (`CreateItem`, `CreateCollection`): dismissed, it sends `/`.
+    pub fn with_path_result(mut self) -> Self {
+        self.dismissed_result = no_path_result;
         self
     }
 
@@ -559,11 +572,11 @@ impl Prompt {
             Ok(Some(result)) => (false, result),
             Ok(None) => {
                 tracing::debug!("Prompt `{}` dismissed.", self.path);
-                (true, empty_result())
+                (true, (self.dismissed_result)())
             }
             Err(err) => {
                 tracing::error!("Prompt `{}` failed: {err}", self.path);
-                (true, empty_result())
+                (true, (self.dismissed_result)())
             }
         };
         // The prompter sees EOF now, before the client hears back.
@@ -733,6 +746,12 @@ fn prompter_error(err: std::io::Error) -> ServiceError {
 /// What a dismissed prompt completes with.
 fn empty_result() -> OwnedValue {
     Value::new::<Vec<OwnedObjectPath>>(vec![])
+        .try_into_owned()
+        .unwrap()
+}
+
+fn no_path_result() -> OwnedValue {
+    Value::new(OwnedObjectPath::default())
         .try_into_owned()
         .unwrap()
 }

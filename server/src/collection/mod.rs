@@ -212,13 +212,19 @@ impl Collection {
         let client = client_of(&header);
         if self.is_locked().await {
             // Create a prompt to unlock the collection and create the item
-            let prompt = crate::prompt::Prompt::new(
+            let mut prompt = crate::prompt::Prompt::new(
                 self.service.clone(),
                 crate::prompt::PromptRole::Unlock,
                 self.label().await,
                 Some(self.clone()),
             )
             .await;
+            // Only to name the caller to the socket prompter: no access step,
+            // so the password allows no read.
+            if let Some(client) = client.clone() {
+                prompt = prompt.with_client(client);
+            }
+            let prompt = prompt.with_path_result();
             let prompt_path = OwnedObjectPath::from(prompt.path().clone());
 
             let collection = self.clone();
