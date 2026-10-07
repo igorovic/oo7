@@ -179,7 +179,15 @@ impl Service {
                 .file_name()?
                 .to_str()?
                 .to_owned();
-            let session_type = SessionType::detect(pid).await;
+            // Only used to choose the GNOME, Plasma or CLI prompter: with the socket
+            // prompter there is nothing to choose. Detecting it can also stall
+            // `OpenSession`: its last fallback asks `org.freedesktop.systemd1` on
+            // the session bus, about 10 s with no user manager answering there.
+            let session_type = if self.prompter_socket().is_some() {
+                SessionType::Unspecified
+            } else {
+                SessionType::detect(pid).await
+            };
             Some(PeerInfo::new(pid, name, session_type))
         }
         .await;
